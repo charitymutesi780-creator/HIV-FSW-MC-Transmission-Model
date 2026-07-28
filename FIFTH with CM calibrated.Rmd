@@ -1,0 +1,904 @@
+---
+title: "Fifth_"
+author: "Charity Mutesi"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+```{r}
+library(deSolve)
+library(ggplot2)
+library(patchwork)
+library(tidyr)
+```
+
+```{r}
+# Parameters
+
+params_fixed <- list(
+
+  # ART initiation
+  gammaF = 0.85,
+  gammaM = 0.89,
+
+  # Natural mortality
+  muF = 0.02,
+  muM = 0.02,
+
+  # HIV related mortality for untreated FSW and MC
+  thetaF = 0.1,
+  thetaM = 0.1,
+  
+  # Mortality among those on ART
+  thetaTF = 0.01,
+  thetaTM = 0.01,
+
+  # Transmission probabilities
+  betaMF = 0.0008,   # male -> female
+  betaFM = 0.0004,   # female -> male
+
+  # Contact rates
+  cF = 1550,
+  cM = 500,
+
+  # Relative infectiousness on ART
+  fT = 0.03,
+
+  # Condom intervention
+  condom_eff = 0.76,
+  condom_covF = 0.50,
+  condom_covM = 0.6,
+
+  # PrEP intervention
+  PrEP_eff = 0.53,
+  PrEP_covF = 0.32,
+  PrEP_covM = 0.60,
+
+  # Circumcision
+  circ_eff = 0.55,
+  circ_cov = 0.50
+)
+```
+```{r}
+# Model function
+model <- function(t, state, p){
+
+  with(as.list(c(state, p)),{
+
+    # TOTAL POPULATIONS
+    
+    NF <- SF + IF + TF
+
+    NM <- SM + IM + TM
+
+    # RECRUITMENT
+    
+    recruitF      <- muF * NF
+    recruitM      <- muM * NM
+
+    # INFECTIOUS PREVALENCE
+    
+    prev_M <- (IM + fT * TM) / NM
+
+    prev_F <- (IF + fT * TF) / NF
+
+    # INTERVENTION REDUCTIONS
+    
+    red_M <- (1 - condom_eff * condom_covM) *
+             (1 - PrEP_eff   * PrEP_covM)
+
+    red_F <- (1 - condom_eff * condom_covF) *
+             (1 - PrEP_eff   * PrEP_covF) *
+             (1 - circ_eff   * circ_cov)
+
+   # FORCE OF INFECTION
+    
+    lambdaF <- cF *
+                    betaMF *
+                    red_M *
+                    prev_M
+
+    lambdaM <- cM *
+               betaFM *
+               red_F *
+               prev_F
+
+    # FSW HIGH RISK
+    
+    dSF <- recruitF -
+                lambdaF * SF -
+                muF * SF
+
+    dIF <- lambdaF * SF -
+                (gammaF + muF + thetaF) * IF
+
+    dTF <- gammaF * IF -
+            (muF + thetaTF) * TF
+
+    # MALE CLIENTS
+
+        dSM <- recruitM -
+           lambdaM * SM -
+           muM * SM
+
+    dIM <- lambdaM * SM -
+           (gammaM + muM + thetaM) * IM
+
+    dTM <- gammaM * IM -
+       (muM + thetaTM) * TM
+
+    # INCIDENCE
+
+    incF <- lambdaF * SF
+
+    incM <- lambdaM * SM
+
+    list(c(dSF, dIF, dTF,
+           dSM, dIM, dTM),
+
+         incF = incF,
+         incM = incM)
+  })
+}
+```
+```{r}
+# Initial conditions
+state <- c(
+
+  SF = 0.62,
+  IF = 0.06,
+  TF = 0.32,
+
+  SM = 0.82,
+  IM = 0.02,
+  TM = 0.16
+)
+# Simulation time
+times <- seq(0, 10, by = 0.1)
+# CALIBRATION TARGETS
+FSW_lower <- 0.30
+FSW_upper <- 0.45
+MC_lower <- 0.10
+MC_upper <- 0.25
+```
+
+```{r}
+# Run model
+run_model <- function(p){
+
+  as.data.frame(
+    ode(
+      y = state,
+      times = times,
+      func = model,
+      parms = p
+    )
+  )
+}
+# BASIC REPRODUCTION NUMBER (R0) with no interventions
+# No condoms, no PrEP, no circumcision, no ART
+
+calc_R0 <- function(p){
+
+  p0 <- p
+
+  # Remove all interventions
+  p0$condom_covF <- 0
+  p0$condom_covM <- 0
+
+  p0$PrEP_covF <- 0
+  p0$PrEP_covM <- 0
+
+  p0$circ_cov <- 0
+
+  p0$thetaF <- 0
+  p0$thetaM <- 0
+
+  DF <- 1/(p0$gammaF + p0$muF)
+  DM <- 1/(p0$gammaM + p0$muM)
+
+  K_MF <- p0$cF * p0$betaMF * DF
+
+  K_FM <- p0$cM * p0$betaFM * DM
+
+  R0 <- sqrt(K_MF * K_FM)
+
+  return(R0)
+}
+
+# EFFECTIVE REPRODUCTION NUMBER (Re)
+calc_Re <- function(p){
+
+  DF <- 1/(p$gammaF + p$muF + p$thetaF)
+  DM <- 1/(p$gammaM + p$muM + p$thetaM)
+
+  red_M <- (1 - p$condom_eff * p$condom_covM) *
+           (1 - p$PrEP_eff * p$PrEP_covM)
+
+  red_F <- (1 - p$condom_eff * p$condom_covF) *
+           (1 - p$PrEP_eff * p$PrEP_covF) *
+           (1 - p$circ_eff * p$circ_cov)
+
+  K_MF <- p$cF *
+          p$betaMF *
+          red_M *
+          DF
+
+  K_FM <- p$cM *
+          p$betaFM *
+          red_F *
+          DM
+
+  Re <- sqrt(K_MF * K_FM)
+
+  return(Re)
+}
+```
+
+```{r}
+# Objective function
+# CALIBRATION OBJECTIVE FUNCTION
+objective <- function(par){
+
+  p <- params_fixed
+
+  # Parameters to calibrate
+  p$betaMF  <- par[1]
+  p$betaFM  <- par[2]
+  p$cF <- par[3]
+  p$cM <- par[4]
+
+  # Run model
+  out <- run_model(p)
+
+  # FSW prevalence
+  FSW_prev <- tail(
+
+    (out$IF + out$TF) /
+
+    (out$SF + out$IF + out$TF),
+
+    1
+  )
+   # Male client prevalence
+  MC_prev <- tail(
+
+    (out$IM + out$TM) /
+
+    (out$SM + out$IM + out$TM),
+
+    1
+  )
+
+  # Range-based FSW error
+  if(FSW_prev < FSW_lower){
+
+  err_FSW <- (FSW_prev - FSW_lower)^2
+
+} else if(FSW_prev > FSW_upper){
+
+  err_FSW <- (FSW_prev - FSW_upper)^2
+
+} else {
+
+  err_FSW <- 0
+
+}
+
+  # Range-based male client error
+  if(MC_prev < MC_lower){
+
+    err_MC <- (MC_prev - MC_lower)^2
+
+  } else if(MC_prev > MC_upper){
+
+    err_MC <- (MC_prev - MC_upper)^2
+
+  } else {
+
+    err_MC <- 0
+
+  }
+
+R0_now <- calc_R0(p)
+err_R0 <- 0
+
+if(R0_now < 1.2){
+
+  err_R0 <- (1.2 - R0_now)^2
+
+}
+
+# Total objective
+  error <- 100 * err_FSW +
+           200 * err_MC  +
+           50  * err_R0
+  return(error)
+}
+# PARAMETER CALIBRATION
+
+fit <- optim(
+
+  par = c(
+    betaMF  = 0.003,
+    betaFM  = 0.001,
+    cF = 1000,
+    cM = 300
+  ),
+
+  fn = objective,
+
+  method = "L-BFGS-B",
+
+  lower = c(
+    0.001,
+    0.0003,
+    800,
+    20
+  ),
+
+  upper = c(
+    0.01,
+    0.005,
+    4000,
+    1200
+  )
+)
+
+# CALIBRATED PARAMETERS
+
+params_calibrated <- params_fixed
+
+params_calibrated$betaMF  <- fit$par[1]
+params_calibrated$betaFM  <- fit$par[2]
+params_calibrated$cF      <- fit$par[3]
+params_calibrated$cM      <- fit$par[4]
+
+# Run calibrated model
+out <- run_model(params_calibrated)
+```
+
+```{r}
+prev_df <- data.frame(
+
+  Time = out$time,
+
+  FSW =
+    (out$IF + out$TF) /
+
+    (out$SF + out$IF + out$TF),
+
+  MC =
+    (out$IM + out$TM) /
+    (out$SM + out$IM + out$TM)
+)
+FSW_prev <- tail(prev_df$FSW, 1)
+MC_prev  <- tail(prev_df$MC, 1)
+
+cat("Final FSW prevalence =", round(FSW_prev, 3), "\n")
+cat("Final MC prevalence  =", round(MC_prev, 3), "\n")
+if(MC_prev >= MC_lower &&
+   MC_prev <= MC_upper){
+
+  cat("Calibration target achieved\n")
+
+} else {
+
+  cat("Outside calibration range\n")
+
+}
+cat("Basic reproduction number (R0) =",
+    round(calc_R0(params_calibrated), 2), "\n")
+
+cat("Effective reproduction number (Re) =",
+    round(calc_Re(params_calibrated), 2), "\n")
+
+cat("\nCALIBRATED PARAMETERS\n")
+
+print(params_calibrated[c(
+  "betaMF",
+  "betaFM",
+  "cF",
+  "cM"
+)])
+```
+
+```{r}
+# Prevalence plots
+p1 <- ggplot(prev_df,
+             aes(Time, FSW)) +
+
+  geom_line(linewidth = 1.2) +
+
+  labs(
+    title = "FSW HIV Prevalence",
+    y = "Prevalence"
+  )
+
+p2 <- ggplot(prev_df,
+             aes(Time, MC)) +
+
+  geom_line(linewidth = 1.2) +
+
+  labs(
+    title = "Male Client HIV Prevalence",
+    y = "Prevalence"
+  )
+
+p1 + p2
+```
+```{r}
+# Incidence
+inc_df <- data.frame(
+  Time = out$time,
+  FSW = out$incF,
+  MC = out$incM
+)
+
+g1 <- ggplot(inc_df,
+             aes(Time, FSW)) +
+
+  geom_line(linewidth = 1.2) +
+
+  labs(
+    title = "FSW HIV Incidence"
+  )
+
+g2 <- ggplot(inc_df,
+             aes(Time, MC)) +
+
+  geom_line(linewidth = 1.2) +
+
+  labs(
+    title = "Male Client HIV Incidence"
+  )
+
+g1 + g2
+```
+
+```{r}
+scenarios <- list(
+
+  # BASELINE
+  Baseline = params_calibrated,
+
+  # NO INTERVENTION
+  No_Intervention = within(params_calibrated, {
+
+    condom_covF <- 0
+    condom_covM <- 0
+    PrEP_covF <- 0
+    PrEP_covM <- 0
+    circ_cov <- 0
+  }),
+
+  # SINGLE INTERVENTIONS
+  Condoms_Only = within(params_calibrated, {
+
+    condom_covF <- 0.85
+    condom_covM <- 0.85
+  }),
+
+  PrEP_Only = within(params_calibrated, {
+
+    PrEP_covF <- 0.90
+    PrEP_covM <- 0.90
+  }),
+
+  Circumcision_Only = within(params_calibrated, {
+
+    circ_cov <- 0.90
+  }),
+
+  # TWO-COMBINATION PACKAGES
+  Condoms_PrEP = within(params_calibrated, {
+
+    condom_covF <- 0.85
+    condom_covM <- 0.85
+
+    PrEP_covF <- 0.90
+    PrEP_covM <- 0.90
+  }),
+
+  Condoms_Circ = within(params_calibrated, {
+
+    condom_covF <- 0.85
+    condom_covM <- 0.85
+
+    circ_cov <- 0.90
+  }),
+
+  PrEP_Circ = within(params_calibrated, {
+
+    PrEP_covF <- 0.90
+    PrEP_covM <- 0.90
+
+    circ_cov <- 0.90
+  }),
+
+  # FULL COMBINATION
+  All_Interventions = within(params_calibrated, {
+
+    condom_covF <- 0.85
+    condom_covM <- 0.85
+
+    PrEP_covF <- 0.90
+    PrEP_covM <- 0.90
+
+    circ_cov <- 0.90
+  })
+)
+# Scenario outputs
+outputs <- lapply(scenarios, run_model)
+```
+
+```{r}
+summary_table <- do.call(
+  rbind,
+
+  lapply(names(outputs), function(n){
+
+    out <- outputs[[n]]
+    p   <- scenarios[[n]]
+
+    FSW_prev <- tail(
+      (out$IF + out$TF) /
+
+      (out$SF  + out$IF  + out$TF),
+      1
+    )
+
+    MC_prev <- tail(
+      (out$IM + out$TM) /
+      (out$SM + out$IM + out$TM),
+      1
+    )
+
+    data.frame(
+      Scenario = n,
+      FSW_prev = round(FSW_prev, 3),
+      MC_prev  = round(MC_prev, 3),
+      R0 = round(calc_R0(p), 2),
+      Re = round(calc_Re(p), 2),
+      FSW_cum_inc = round(sum(out$incF), 2),
+      MC_cum_inc  = round(sum(out$incM), 2)
+    )
+  })
+)
+summary_table
+
+# INTERVENTION EFFECTIVENESS
+
+summary_table$FSW_reduction <- 
+  1 - (
+    summary_table$FSW_prev /
+    summary_table$FSW_prev[
+      summary_table$Scenario == "Baseline"
+    ]
+  )
+
+summary_table$MC_reduction <- 
+  1 - (
+    summary_table$MC_prev /
+    summary_table$MC_prev[
+      summary_table$Scenario == "Baseline"
+    ]
+  )
+
+# Rank interventions
+summary_table <- summary_table[
+  order(summary_table$FSW_reduction,
+        decreasing = TRUE),
+]
+
+summary_table
+
+# RANKED INTERVENTION EFFECTIVENESS
+
+rank_df <- subset(
+  summary_table,
+  !(Scenario %in%
+      c(
+        "Baseline",
+        "No_Intervention"
+      ))
+)
+
+rank_long <- data.frame(
+
+  Scenario = rep(rank_df$Scenario, 2),
+
+  Population = c(
+    rep("FSW", nrow(rank_df)),
+    rep("Male Clients", nrow(rank_df))
+  ),
+
+  Reduction = c(
+    rank_df$FSW_reduction,
+    rank_df$MC_reduction
+  )
+)
+
+ggplot(
+  rank_long,
+  aes(
+    x = Scenario,
+    y = Reduction * 100,
+    fill = Population
+  )
+) +
+
+  geom_col(position = "dodge") +
+
+  coord_flip() +
+
+  theme_bw() +
+
+  labs(
+    title = "Reduction in HIV Prevalence by Intervention",
+    x = "",
+    y = "% Reduction"
+  )
+```
+```{r}
+# Scenario prevalence plots
+plot_df <- do.call(
+  rbind,
+
+  lapply(names(outputs), function(n){
+
+    out <- outputs[[n]]
+
+    data.frame(
+
+      Time = out$time,
+
+      FSW =
+        (out$IF + out$TF) /
+
+        (out$SF + out$IF + out$TF),
+
+      MC =
+        (out$IM + out$TM) /
+        (out$SM + out$IM + out$TM),
+
+      Scenario = n
+    )
+  })
+)
+
+plot_df2 <- subset(
+  plot_df,
+  Scenario %in% c(
+    "Baseline",
+    "No_Intervention",
+    "All_Interventions"
+  )
+)
+
+ggplot(
+  plot_df2,
+  aes(Time, FSW, color = Scenario)
+) +
+  geom_line(linewidth=1.3) +
+  theme_bw() +
+  labs(
+    title="FSW HIV Prevalence",
+    y="Prevalence"
+  )
+ggplot(
+  plot_df2,
+  aes(Time, MC, color = Scenario)
+) +
+  geom_line(linewidth = 1.3) +
+  theme_bw() +
+  labs(
+    title = "Male Client HIV Prevalence",
+    y = "Prevalence"
+  )
+```
+
+```{r}
+# Sensitivity analysis
+sens_grid <- expand.grid(
+
+  beta_scale = c(0.5, 0.75, 1, 1.25, 1.5),
+
+  condom_covF = c(0.2, 0.4, 0.6, 0.8),
+
+  PrEP_covF = c(0.0, 0.2, 0.4)
+
+)
+
+sens_results <- data.frame()
+
+for(i in 1:nrow(sens_grid)){
+
+  # copy baseline parameters
+  p <- params_calibrated
+
+  # vary transmission probabilities
+  p$betaMF <- p$betaMF * sens_grid$beta_scale[i]
+  p$betaFM <- p$betaFM * sens_grid$beta_scale[i]
+
+  # vary interventions
+  p$condom_covF <- sens_grid$condom_covF[i]
+  p$PrEP_covF   <- sens_grid$PrEP_covF[i]
+
+  # run model
+  out <- run_model(p)
+
+  # final prevalence
+  FSW_prev <- tail(
+    (out$IF + out$TF) /
+
+    (out$SF + out$IF + out$TF),
+    1
+  )
+
+  MC_prev <- tail(
+    (out$IM + out$TM) /
+    (out$SM + out$IM + out$TM),
+    1
+  )
+
+  # cumulative incidence
+  FSW_cum <- sum(out$incF)
+  MC_cum  <- sum(out$incM)
+
+  sens_results <- rbind(
+    sens_results,
+
+    data.frame(
+      beta_scale  = sens_grid$beta_scale[i],
+      condom_covF = sens_grid$condom_covF[i],
+      PrEP_covF   = sens_grid$PrEP_covF[i],
+
+      FSW_prev = FSW_prev,
+      MC_prev  = MC_prev,
+
+      FSW_cum = FSW_cum,
+      MC_cum  = MC_cum
+    )
+  )
+}
+# SENSITIVITY PLOTS
+# FSW Prevalence
+ggplot(
+  sens_results,
+  aes(beta_scale,
+      FSW_prev,
+      color = factor(condom_covF))
+) +
+
+  geom_point(size = 3) +
+
+  geom_line() +
+
+  facet_wrap(~PrEP_covF) +
+
+  labs(
+    title = "Sensitivity Analysis: FSW Prevalence",
+    x = "Transmission Scaling",
+    y = "FSW HIV Prevalence",
+    color = "Condom Coverage"
+  )
+  ggplot(
+  sens_results,
+  aes(beta_scale,
+      FSW_prev,
+      color = factor(condom_covF))
+) +
+
+  geom_point(size = 3) +
+
+  geom_line() +
+
+  facet_wrap(~PrEP_covF) +
+
+  labs(
+    title = "Sensitivity Analysis: FSW Prevalence",
+    x = "Transmission Scaling",
+    y = "FSW HIV Prevalence",
+    color = "Condom Coverage"
+  )
+# Male client prevalence
+  ggplot(
+  sens_results,
+  aes(beta_scale,
+      MC_prev,
+      color = factor(condom_covF))
+) +
+
+  geom_point(size = 3) +
+
+  geom_line() +
+
+  facet_wrap(~PrEP_covF) +
+
+  labs(
+    title = "Sensitivity Analysis: Male Client Prevalence",
+    x = "Transmission Scaling",
+    y = "Male Client HIV Prevalence",
+    color = "Condom Coverage"
+  )
+```
+```{r}
+# Heat maps
+coverage_grid <- expand.grid(
+
+  condom_covF = seq(0, 0.9, by = 0.1),
+
+  PrEP_covF = seq(0, 0.8, by = 0.1)
+
+)
+
+heatmap_results <- data.frame()
+
+# Heat map analysis
+for(i in 1:nrow(coverage_grid)){
+
+  p <- params_calibrated
+
+  p$condom_covF <- coverage_grid$condom_covF[i]
+  p$PrEP_covF   <- coverage_grid$PrEP_covF[i]
+
+  out <- run_model(p)
+
+  # cumulative incidence
+  FSW_cum <- sum(out$incF)
+  MC_cum  <- sum(out$incM)
+
+  # prevalence
+  FSW_prev <- tail(
+    (out$IF + out$TF) /
+
+    (out$SF + out$IF + out$TF),
+    1
+  )
+
+  MC_prev <- tail(
+    (out$IM + out$TM) /
+    (out$SM + out$IM + out$TM),
+    1
+  )
+
+  heatmap_results <- rbind(
+    heatmap_results,
+
+    data.frame(
+      condom_covF = p$condom_covF,
+      PrEP_covF   = p$PrEP_covF,
+
+      FSW_cum = FSW_cum,
+      MC_cum  = MC_cum,
+
+      FSW_prev = FSW_prev,
+      MC_prev  = MC_prev
+    )
+  )
+}
+# Heat map FSW prevalence
+ggplot(
+  heatmap_results,
+  aes(
+    x = condom_covF,
+    y = PrEP_covF,
+    fill = FSW_prev
+  )
+) +
+
+  geom_tile() +
+
+  labs(
+    title = "Heatmap: FSW HIV Prevalence",
+    x = "FSW Condom Coverage",
+    y = "FSW PrEP Coverage",
+    fill = "Prevalence"
+  )
+```
