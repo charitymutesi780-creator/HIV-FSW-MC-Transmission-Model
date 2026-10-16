@@ -3,8 +3,8 @@ title: "Fifth_"
 author: "Charity Mutesi"
 date: "`r Sys.Date()`"
 output:
-  pdf_document: default
   html_document: default
+  pdf_document: default
 ---
 
 ```{r setup, include=FALSE}
@@ -15,6 +15,7 @@ library(deSolve)
 library(ggplot2)
 library(patchwork)
 library(tidyr)
+library(pracma)
 ```
 
 ```{r}
@@ -39,8 +40,8 @@ params_fixed <- list(
   thetaTM = 0.01,
 
   # Transmission probabilities
-  betaMF = 0.0008,   # male -> female
-  betaFM = 0.0004,   # female -> male
+  betaMF = 0.0008,   # male client -> fsw
+  betaFM = 0.0004,   # fsw -> male client
 
   # Contact rates
   cF = 1550,
@@ -60,92 +61,84 @@ params_fixed <- list(
   PrEP_covM = 0.60,
 
   # Circumcision
+  
   circ_eff = 0.55,
   circ_cov = 0.50
 )
 ```
 ```{r}
 # Model function
-model <- function(t, state, p){
 
-  with(as.list(c(state, p)),{
+model <- function(t, state, p) {
 
-    # TOTAL POPULATIONS
-    
+  with(as.list(c(state, p)), {
+
+    # Total populations
     NF <- SF + IF + TF
-
     NM <- SM + IM + TM
 
-    # RECRUITMENT
-    
-    recruitF      <- muF * NF
-    recruitM      <- muM * NM
+    # Recruitment balances natural mortality
+    recruitF <- muF * NF + thetaF * IF + thetaTF * TF
+    recruitM <- muM * NM + thetaM * IM + thetaTM * TM
 
-    # INFECTIOUS PREVALENCE
-    
+    # Infectious prevalence, accounting for reduced
+    # infectiousness among people receiving ART
     prev_M <- (IM + fT * TM) / NM
-
     prev_F <- (IF + fT * TF) / NF
 
-    # INTERVENTION REDUCTIONS
-    
-    red_M <- (1 - condom_eff * condom_covM) *
-             (1 - PrEP_eff   * PrEP_covM)
+    # Effective condom coverage:
+    # probability that at least one partner uses a condom
+    condom_cov_eff <- 1 -
+      (1 - condom_covF) * (1 - condom_covM)
 
-    red_F <- (1 - condom_eff * condom_covF) *
-             (1 - PrEP_eff   * PrEP_covF) *
-             (1 - circ_eff   * circ_cov)
+    # Condom protection applies in both directions
+    red_condom <- 1 -
+      condom_eff * condom_cov_eff
 
-   # FORCE OF INFECTION
-    
-    lambdaF <- cF *
-                    betaMF *
-                    red_M *
-                    prev_M
+    # Susceptibility reductions in the correct populations
+    red_F <- red_condom *
+      (1 - PrEP_eff * PrEP_covF)
 
-    lambdaM <- cM *
-               betaFM *
-               red_F *
-               prev_F
+    red_M <- red_condom *
+      (1 - PrEP_eff * PrEP_covM) *
+      (1 - circ_eff * circ_cov)
 
-    # FSW HIGH RISK
-    
-    dSF <- recruitF -
-                lambdaF * SF -
-                muF * SF
+    # Forces of infection
+    lambdaF <- cF * betaMF * red_F * prev_M
+
+    lambdaM <- cM * betaFM * red_M * prev_F
+
+    # Female sex workers
+    dSF <- recruitF - lambdaF * SF - muF * SF
 
     dIF <- lambdaF * SF -
-                (gammaF + muF + thetaF) * IF
+      (gammaF + muF + thetaF) * IF
 
     dTF <- gammaF * IF -
-            (muF + thetaTF) * TF
+      (muF + thetaTF) * TF
 
-    # MALE CLIENTS
-
-        dSM <- recruitM -
-           lambdaM * SM -
-           muM * SM
+    # Male clients
+    dSM <- recruitM - lambdaM * SM - muM * SM
 
     dIM <- lambdaM * SM -
-           (gammaM + muM + thetaM) * IM
+      (gammaM + muM + thetaM) * IM
 
     dTM <- gammaM * IM -
-       (muM + thetaTM) * TM
+      (muM + thetaTM) * TM
 
-    # INCIDENCE
-
+    # Incidence rates
     incF <- lambdaF * SF
-
     incM <- lambdaM * SM
 
-    list(c(dSF, dIF, dTF,
-           dSM, dIM, dTM),
-
-         incF = incF,
-         incM = incM)
+    list(
+      c(dSF, dIF, dTF, dSM, dIM, dTM),
+      incF = incF,
+      incM = incM
+    )
   })
 }
 ```
+
 ```{r}
 # Initial conditions
 state <- c(
@@ -161,6 +154,9 @@ state <- c(
 # Simulation time
 times <- seq(0, 10, by = 0.1)
 # CALIBRATION TARGETS
+FSW_target <- 0.375
+MC_target <- 0.175
+
 FSW_lower <- 0.30
 FSW_upper <- 0.45
 MC_lower <- 0.10
@@ -180,235 +176,609 @@ run_model <- function(p){
     )
   )
 }
-# BASIC REPRODUCTION NUMBER (R0) with no interventions
-# No condoms, no PrEP, no circumcision, no ART
+# Expected infectiousness-weighted duration in each population
+infectious_duration_F <- function(p) {
+  1 / (p$gammaF + p$muF + p$thetaF) +
+    p$fT * p$gammaF /
+    ((p$gammaF + p$muF + p$thetaF) *
+       (p$muF + p$thetaTF))
+}
 
-calc_R0 <- function(p){
+infectious_duration_M <- function(p) {
+  1 / (p$gammaM + p$muM + p$thetaM) +
+    p$fT * p$gammaM /
+    ((p$gammaM + p$muM + p$thetaM) *
+       (p$muM + p$thetaTM))
+}
 
-  p0 <- p
+# Next-generation matrix calculation
+# Infected-state order: IF, TF, IM, TM
 
-  # Remove all interventions
-  p0$condom_covF <- 0
-  p0$condom_covM <- 0
+calculate_ngm <- function(p, state_now = NULL,
+                           interventions = FALSE) {
 
-  p0$PrEP_covF <- 0
-  p0$PrEP_covM <- 0
+  # Progression and exit rates
+  aF <- p$gammaF + p$muF + p$thetaF
+  bF <- p$muF + p$thetaTF
 
-  p0$circ_cov <- 0
+  aM <- p$gammaM + p$muM + p$thetaM
+  bM <- p$muM + p$thetaTM
 
-  p0$thetaF <- 0
-  p0$thetaM <- 0
+  # Prevention multipliers
+  red_F <- 1
+  red_M <- 1
 
-  DF <- 1/(p0$gammaF + p0$muF)
-  DM <- 1/(p0$gammaM + p0$muM)
+  if (interventions) {
 
-  K_MF <- p0$cF * p0$betaMF * DF
+    condom_cov_eff <- 1 -
+      (1 - p$condom_covF) *
+      (1 - p$condom_covM)
 
-  K_FM <- p0$cM * p0$betaFM * DM
+    red_condom <- 1 - p$condom_eff * condom_cov_eff
 
-  R0 <- sqrt(K_MF * K_FM)
+    red_F <- red_condom *
+      (1 - p$PrEP_eff * p$PrEP_covF)
+
+    red_M <- red_condom *
+      (1 - p$PrEP_eff * p$PrEP_covM) *
+      (1 - p$circ_eff * p$circ_cov)
+  }
+
+  # Susceptible proportions:
+  # At the disease-free equilibrium, both are 1.
+  if (is.null(state_now)) {
+    sF <- 1
+    sM <- 1
+  } else {
+    NF <- sum(state_now[c("SF", "IF", "TF")])
+    NM <- sum(state_now[c("SM", "IM", "TM")])
+
+    sF <- as.numeric(state_now["SF"] / NF)
+    sM <- as.numeric(state_now["SM"] / NM)
+  }
+
+  # New infection matrix F
+  # Rows/columns: IF, TF, IM, TM
+  F <- matrix(
+    0, nrow = 4, ncol = 4,
+    dimnames = list(
+      c("IF", "TF", "IM", "TM"),
+      c("IF", "TF", "IM", "TM")
+    )
+  )
+
+  F["IF", "IM"] <- p$cF * p$betaMF * red_F * sF
+  F["IF", "TM"] <- p$cF * p$betaMF * red_F * sF * p$fT
+
+  F["IM", "IF"] <- p$cM * p$betaFM * red_M * sM
+  F["IM", "TF"] <- p$cM * p$betaFM * red_M * sM * p$fT
+
+  # Transition matrix V
+  V <- matrix(
+    0, nrow = 4, ncol = 4,
+    dimnames = list(
+      c("IF", "TF", "IM", "TM"),
+      c("IF", "TF", "IM", "TM")
+    )
+  )
+
+  V["IF", "IF"] <- aF
+  V["TF", "IF"] <- -p$gammaF
+  V["TF", "TF"] <- bF
+
+  V["IM", "IM"] <- aM
+  V["TM", "IM"] <- -p$gammaM
+  V["TM", "TM"] <- bM
+
+  # Next-generation matrix
+  K <- F %*% solve(V)
+
+  list(F = F, V = V, K = K)
+}
+
+# Basic reproduction number for a completely untreated epidemic
+# No ART, condoms, PrEP, or circumcision
+
+calc_R0_untreated <- function(p) {
+
+  # Exit rates for untreated HIV-infected individuals
+  # Natural mortality + HIV-related mortality
+  aF <- p$muF + p$thetaF
+  aM <- p$muM + p$thetaM
+
+  # New infection matrix
+  # Infected-state order: IF, IM
+  F <- matrix(
+    c(
+      0,                  p$cF * p$betaMF,
+      p$cM * p$betaFM,    0
+    ),
+    nrow = 2,
+    byrow = TRUE,
+    dimnames = list(
+      c("IF", "IM"),
+      c("IF", "IM")
+    )
+  )
+
+  # Transition matrix: no ART initiation or ART compartments
+  V <- diag(
+    c(aF, aM),
+    nrow = 2,
+    ncol = 2
+  )
+
+  dimnames(V) <- list(
+    c("IF", "IM"),
+    c("IF", "IM")
+  )
+
+  # Next-generation matrix
+  K <- F %*% solve(V)
+
+  # R0 is the spectral radius of the next-generation matrix
+  R0 <- max(Mod(eigen(K)$values))
 
   return(R0)
 }
 
-# EFFECTIVE REPRODUCTION NUMBER (Re)
-calc_Re <- function(p){
+# Re: interventions and susceptible proportions included
+calc_Re_NGM <- function(p, state_now) {
 
-  DF <- 1/(p$gammaF + p$muF + p$thetaF)
-  DM <- 1/(p$gammaM + p$muM + p$thetaM)
+  matrices <- calculate_ngm(
+    p,
+    state_now = state_now,
+    interventions = TRUE
+  )
 
-  red_M <- (1 - p$condom_eff * p$condom_covM) *
-           (1 - p$PrEP_eff * p$PrEP_covM)
+  max(Mod(eigen(matrices$K)$values))
+}
 
-  red_F <- (1 - p$condom_eff * p$condom_covF) *
-           (1 - p$PrEP_eff * p$PrEP_covF) *
-           (1 - p$circ_eff * p$circ_cov)
 
-  K_MF <- p$cF *
-          p$betaMF *
-          red_M *
-          DF
+# Basic reproduction number: no condoms, PrEP or circumcision
 
-  K_FM <- p$cM *
-          p$betaFM *
-          red_F *
-          DM
+calc_R0 <- function(p) {
+  calc_R0_untreated(p)
+}
 
-  Re <- sqrt(K_MF * K_FM)
+calc_Re <- function(p, state_now) {
+  calc_Re_NGM(p, state_now)
+}
 
-  return(Re)
+# Inspect the matrices
+ngm <- calculate_ngm(params_fixed)
+
+ngm$F
+ngm$V
+ngm$K
+
+# Independent analytical R0 calculation
+calc_R0_analytic <- function(p) {
+
+  aF <- p$muF + p$thetaF
+  aM <- p$muM + p$thetaM
+
+  K_MF <- p$cF * p$betaMF / aM
+  K_FM <- p$cM * p$betaFM / aF
+
+  sqrt(K_MF * K_FM)
+}
+
+# Compare analytical formula against the NGM
+comparison <- data.frame(
+  Method = c(
+    "Analytical formula: untreated R0",
+    "Next-generation matrix: untreated R0"
+  ),
+  R0 = c(
+    calc_R0_analytic(params_fixed),
+    calc_R0_untreated(params_fixed)
+  )
+)
+
+print(comparison)
+
+if (!isTRUE(all.equal(
+  comparison$R0[1],
+  comparison$R0[2],
+  tolerance = 1e-6
+))) {
+  stop("Untreated R0 validation failed.")
+} else {
+  cat("Untreated R0 validation passed.\n")
 }
 ```
 
 ```{r}
-# Objective function
-# CALIBRATION OBJECTIVE FUNCTION
-objective <- function(par){
+#Run models based on different scenarios
+evaluate_model <- function(p) {
+
+  out <- run_model(p)
+
+  FSW_prev <- tail(
+    (out$IF + out$TF) /
+      (out$SF + out$IF + out$TF), 1
+  )
+
+  MC_prev <- tail(
+    (out$IM + out$TM) /
+      (out$SM + out$IM + out$TM), 1
+  )
+
+  state_end <- c(
+    SF = tail(out$SF, 1),
+    IF = tail(out$IF, 1),
+    TF = tail(out$TF, 1),
+    SM = tail(out$SM, 1),
+    IM = tail(out$IM, 1),
+    TM = tail(out$TM, 1)
+  )
+
+  data.frame(
+    FSW_prev = as.numeric(FSW_prev),
+    MC_prev  = as.numeric(MC_prev),
+    R0 = calc_R0_untreated(p),
+    Re = calc_Re_NGM(p, state_end)
+  )
+
+}
+
+# Scenario 1: Literature-based model without calibration
+scenario1 <- params_fixed
+
+res1 <- evaluate_model(scenario1)
+
+res1
+
+#Scenario 2: Calibrating transmission probabilities only
+objective_beta <- function(par){
 
   p <- params_fixed
 
-  # Parameters to calibrate
-  p$betaMF  <- par[1]
-  p$betaFM  <- par[2]
+  p$betaMF <- par[1]
+  p$betaFM <- par[2]
+
+  out <- run_model(p)
+
+  FSW_prev <- tail(
+    (out$IF + out$TF) /
+      (out$SF + out$IF + out$TF), 1)
+
+  MC_prev <- tail(
+    (out$IM + out$TM) /
+      (out$SM + out$IM + out$TM), 1)
+
+  err_FSW <- (FSW_prev - 0.375)^2
+  err_MC  <- (MC_prev - 0.175)^2
+
+  return(err_FSW + err_MC)
+
+}
+ 
+fit2 <- optim(
+  par = c(0.003,0.001),
+  fn = objective_beta,
+  method = "L-BFGS-B",
+  lower = c(0.001,0.0003),
+  upper = c(0.01,0.005)
+)
+# Check optimizer convergence
+print(fit2$convergence)
+print(fit2$message)
+print(fit2$par)
+
+if (fit2$convergence != 0) {
+  stop("Scenario 2 did not converge. Refit using multiple starting values.")
+}
+
+scenario2 <- params_fixed
+
+scenario2$betaMF <- fit2$par[1]
+scenario2$betaFM <- fit2$par[2]
+
+res2 <- evaluate_model(scenario2)
+# Inspect final calibrated parameters
+print(scenario2)
+
+# Evaluate the final model
+final_results <- evaluate_model(scenario2)
+print(final_results)
+
+
+# Scenario 3: optimization (upper-bound solution)
+objective_contact <- function(par){
+
+  p <- params_fixed
+
+  p$cF <- par[1]
+  p$cM <- par[2]
+
+  out <- run_model(p)
+
+  FSW_prev <- tail(
+    (out$IF + out$TF) /
+      (out$SF + out$IF + out$TF), 1)
+
+  MC_prev <- tail(
+    (out$IM + out$TM) /
+      (out$SM + out$IM + out$TM), 1)
+
+  err_FSW <- (FSW_prev - 0.375)^2
+  err_MC  <- (MC_prev - 0.175)^2
+
+  return(err_FSW + err_MC)
+  
+}
+#Diagnostics
+# One: Diagnose whether the objective responds to contact rates
+
+contact_test <- data.frame(
+  cF = c(800, 1200, 1550, 2000, 3000, 4000),
+  cM = c(20, 100, 300, 500, 800, 1200)
+)
+
+contact_test$Objective <- mapply(
+  function(cf, cm) {
+    objective_contact(c(cf, cm))
+  },
+  contact_test$cF,
+  contact_test$cM
+)
+
+print(contact_test, digits = 8)
+
+# STEP 2: Vary cF while keeping cM fixed
+
+test_cF <- data.frame(
+  cF = seq(800, 4000, by = 200)
+)
+
+test_cF$Objective <- sapply(
+  test_cF$cF,
+  function(x) {
+    objective_contact(c(x, params_fixed$cM))
+  }
+)
+
+print(test_cF, digits = 8)
+
+
+# STEP 3: Vary cM while keeping cF fixed
+
+test_cM <- data.frame(
+  cM = seq(20, 1200, by = 20)
+)
+
+test_cM$Objective <- sapply(
+  test_cM$cM,
+  function(x) {
+    objective_contact(c(params_fixed$cF, x))
+  }
+)
+
+# STEP 4: Numerical gradient diagnostic
+
+x0 <- c(
+  cF = params_fixed$cF,
+  cM = params_fixed$cM
+)
+
+f0 <- objective_contact(x0)
+
+h <- c(
+  cF = 1,
+  cM = 1
+)
+
+gradient_check <- data.frame(
+  Parameter = names(x0),
+  Objective_at_start = f0,
+  Forward_difference = NA_real_,
+  Backward_difference = NA_real_
+)
+
+for (i in seq_along(x0)) {
+
+  x_plus <- x0
+  x_minus <- x0
+
+  x_plus[i] <- x_plus[i] + h[i]
+  x_minus[i] <- x_minus[i] - h[i]
+
+  gradient_check$Forward_difference[i] <-
+    (objective_contact(x_plus) - f0) / h[i]
+
+  gradient_check$Backward_difference[i] <-
+    (f0 - objective_contact(x_minus)) / h[i]
+}
+
+print(gradient_check, digits = 10)
+
+fit3 <- optim(
+  par = c(1550,500),
+  fn = objective_contact,
+  method = "L-BFGS-B",
+  lower = c(800,20),
+  upper = c(4000,1200)
+)
+
+# Scenario 3: Scaled contact-rate optimization
+
+objective_contact_scaled <- function(x) {
+  objective_contact(c(x[1] * 1000, x[2] * 1000))
+}
+
+fit3_scaled <- optim(
+  par = c(1.55, 0.50),
+  fn = objective_contact_scaled,
+  method = "L-BFGS-B",
+  lower = c(0.8, 0.02),
+  upper = c(4.0, 1.2),
+  control = list(maxit = 2000, factr = 1e4)
+)
+
+# Display results
+print(fit3_scaled$par * 1000)
+print(fit3_scaled$value)
+print(fit3_scaled$convergence)
+print(fit3_scaled$message)
+
+# Confirm the objective using the fitted scaled parameters
+print(
+  objective_contact(
+    fit3_scaled$par * 1000
+  )
+)
+
+# Scenario 3: Using the scaled optimizer's fitted parameters
+
+scenario3 <- params_fixed
+
+scenario3$cF <- as.numeric(fit3_scaled$par[1] * 1000)
+scenario3$cM <- as.numeric(fit3_scaled$par[2] * 1000)
+
+# Evaluate the model using the fitted contact rates
+res3 <- evaluate_model(scenario3)
+
+# Compare initial and fitted contact rates
+contact_comparison <- data.frame(
+  Parameter = c("cF", "cM"),
+  Initial = c(params_fixed$cF, params_fixed$cM),
+  Fitted = c(scenario3$cF, scenario3$cM)
+)
+
+print(contact_comparison)
+
+# Compare targets with fitted prevalence
+prevalence_comparison <- data.frame(
+  Population = c("FSW", "Male clients"),
+  Target = c(0.375, 0.175),
+  Fitted = c(res3$FSW_prev, res3$MC_prev)
+)
+
+prevalence_comparison$Absolute_Error <- abs(
+  prevalence_comparison$Target -
+    prevalence_comparison$Fitted
+)
+
+print(prevalence_comparison)
+
+# Verify the objective
+print(objective_contact(c(scenario3$cF, scenario3$cM)))
+
+# Scenario 4: Joint calibration to prevalence only
+objective_joint <- function(par){
+
+  p <- params_fixed
+
+  p$betaMF <- par[1]
+  p$betaFM <- par[2]
   p$cF <- par[3]
   p$cM <- par[4]
 
-  # Run model
   out <- run_model(p)
 
-  # FSW prevalence
   FSW_prev <- tail(
-
     (out$IF + out$TF) /
+      (out$SF + out$IF + out$TF), 1)
 
-    (out$SF + out$IF + out$TF),
-
-    1
-  )
-   # Male client prevalence
   MC_prev <- tail(
-
     (out$IM + out$TM) /
+      (out$SM + out$IM + out$TM), 1)
 
-    (out$SM + out$IM + out$TM),
+   err_FSW <- (FSW_prev - 0.375)^2
+  err_MC  <- (MC_prev - 0.175)^2
 
-    1
-  )
-
-  # Range-based FSW error
-  if(FSW_prev < FSW_lower){
-
-  err_FSW <- (FSW_prev - FSW_lower)^2
-
-} else if(FSW_prev > FSW_upper){
-
-  err_FSW <- (FSW_prev - FSW_upper)^2
-
-} else {
-
-  err_FSW <- 0
+  return(err_FSW + err_MC)
 
 }
 
-  # Range-based male client error
-  if(MC_prev < MC_lower){
-
-    err_MC <- (MC_prev - MC_lower)^2
-
-  } else if(MC_prev > MC_upper){
-
-    err_MC <- (MC_prev - MC_upper)^2
-
-  } else {
-
-    err_MC <- 0
-
-  }
-
-R0_now <- calc_R0(p)
-err_R0 <- 0
-
-if(R0_now < 1.2){
-
-  err_R0 <- (1.2 - R0_now)^2
-
-}
-
-# Total objective
-  error <- 100 * err_FSW +
-           200 * err_MC  +
-           50  * err_R0
-  return(error)
-}
-# PARAMETER CALIBRATION
-
-fit <- optim(
-
-  par = c(
-    betaMF  = 0.003,
-    betaFM  = 0.001,
-    cF = 1000,
-    cM = 300
-  ),
-
-  fn = objective,
-
+fit4 <- optim(
+  par = c(0.003,0.001,1000,300),
+  fn = objective_joint,
   method = "L-BFGS-B",
+  lower = c(0.001,0.0003,800,20),
+  upper = c(0.01,0.005,4000,1200)
+)
+print(fit4$convergence)
+print(fit4$message)
 
-  lower = c(
-    0.001,
-    0.0003,
-    800,
-    20
+scenario4 <- params_fixed
+
+scenario4$betaMF <- fit4$par[1]
+scenario4$betaFM <- fit4$par[2]
+scenario4$cF     <- fit4$par[3]
+scenario4$cM     <- fit4$par[4]
+
+res4 <- evaluate_model(scenario4)
+
+# Compare all calibration scenarios
+scenario_comparison <- data.frame(
+  Scenario = c(
+    "Scenario 1: Literature-based",
+    "Scenario 2: Transmission probabilities calibrated",
+    "Scenario 3: Contact rates optimization (upper-bound solution)",
+    "Scenario 4: Joint calibration"
   ),
+  rbind(res1, res2, res3, res4)
+)
 
-  upper = c(
-    0.01,
-    0.005,
-    4000,
-    1200
+print(scenario_comparison, digits = 4)
+
+```
+
+```{r}
+
+# Evaluate each scenario
+res1 <- evaluate_model(scenario1)
+res2 <- evaluate_model(scenario2)
+res3 <- evaluate_model(scenario3)
+res4 <- evaluate_model(scenario4)
+
+results_all <- data.frame(
+  Scenario = c(
+    "1. Literature-based",
+    "2. Transmission probabilities calibrated",
+    "3. Contact rates calibrated",
+    "4. Joint calibration"
+      ),
+  FSW_prev = c(
+    res1$FSW_prev, res2$FSW_prev, res3$FSW_prev,
+    res4$FSW_prev
+  ),
+  MC_prev = c(
+    res1$MC_prev, res2$MC_prev, res3$MC_prev,
+    res4$MC_prev
+  ),
+  R0 = c(res1$R0, res2$R0, res3$R0, res4$R0),
+  Re = c(res1$Re, res2$Re, res3$Re, res4$Re),
+  Objective = c(
+    NA, fit2$value, fit3_scaled$value, fit4$value
   )
 )
 
-# CALIBRATED PARAMETERS
-
-params_calibrated <- params_fixed
-
-params_calibrated$betaMF  <- fit$par[1]
-params_calibrated$betaFM  <- fit$par[2]
-params_calibrated$cF      <- fit$par[3]
-params_calibrated$cM      <- fit$par[4]
-
-# Run calibrated model
-out <- run_model(params_calibrated)
-```
-
-```{r}
-prev_df <- data.frame(
-
-  Time = out$time,
-
-  FSW =
-    (out$IF + out$TF) /
-
-    (out$SF + out$IF + out$TF),
-
-  MC =
-    (out$IM + out$TM) /
-    (out$SM + out$IM + out$TM)
+results_all_print <- results_all
+results_all_print[-1] <- lapply(
+  results_all_print[-1], round, digits = 3
 )
-FSW_prev <- tail(prev_df$FSW, 1)
-MC_prev  <- tail(prev_df$MC, 1)
 
-cat("Final FSW prevalence =", round(FSW_prev, 3), "\n")
-cat("Final MC prevalence  =", round(MC_prev, 3), "\n")
-if(MC_prev >= MC_lower &&
-   MC_prev <= MC_upper){
-
-  cat("Calibration target achieved\n")
-
-} else {
-
-  cat("Outside calibration range\n")
-
-}
-cat("Basic reproduction number (R0) =",
-    round(calc_R0(params_calibrated), 2), "\n")
-
-cat("Effective reproduction number (Re) =",
-    round(calc_Re(params_calibrated), 2), "\n")
-
-cat("\nCALIBRATED PARAMETERS\n")
-
-print(params_calibrated[c(
-  "betaMF",
-  "betaFM",
-  "cF",
-  "cM"
-)])
+results_all_print
 ```
 
 ```{r}
+# Generate prevalence data from the model
+
+out_final <- run_model(scenario2)
+
+prev_df <- data.frame(
+  Time = out_final$time,
+  FSW = (out_final$IF + out_final$TF) /
+        (out_final$SF + out_final$IF + out_final$TF),
+  MC  = (out_final$IM + out_final$TM) /
+        (out_final$SM + out_final$IM + out_final$TM)
+)
+
+head(prev_df)
 # Prevalence plots
 p1 <- ggplot(prev_df,
              aes(Time, FSW)) +
@@ -435,9 +805,9 @@ p1 + p2
 ```{r}
 # Incidence
 inc_df <- data.frame(
-  Time = out$time,
-  FSW = out$incF,
-  MC = out$incM
+  Time = out_final$time,
+  FSW = out_final$incF,
+  MC = out_final$incM
 )
 
 g1 <- ggplot(inc_df,
@@ -461,166 +831,283 @@ g2 <- ggplot(inc_df,
 g1 + g2
 ```
 
-```{r}
+```{r intervention-scenarios}
+# Final calibrated parameter set
+base_p <- scenario2
+
+# No-intervention comparator
+p_none <- base_p
+p_none$condom_covF <- 0
+p_none$condom_covM <- 0
+p_none$PrEP_covF <- 0
+p_none$PrEP_covM <- 0
+p_none$circ_cov <- 0
+
+# Intensified condom coverage, retaining baseline PrEP/circumcision
+p_condoms <- base_p
+p_condoms$condom_covF <- 0.85
+p_condoms$condom_covM <- 0.85
+
+# Intensified PrEP coverage, retaining baseline condoms/circumcision
+p_prep <- base_p
+p_prep$PrEP_covF <- 0.90
+p_prep$PrEP_covM <- 0.90
+
+# Intensified circumcision coverage, retaining baseline condoms/PrEP
+p_circ <- base_p
+p_circ$circ_cov <- 0.90
+
+# Intensified condoms and PrEP, retaining baseline circumcision
+p_condoms_prep <- base_p
+p_condoms_prep$condom_covF <- 0.85
+p_condoms_prep$condom_covM <- 0.85
+p_condoms_prep$PrEP_covF <- 0.90
+p_condoms_prep$PrEP_covM <- 0.90
+
+# Intensified condoms and circumcision, retaining baseline PrEP
+p_condoms_circ <- base_p
+p_condoms_circ$condom_covF <- 0.85
+p_condoms_circ$condom_covM <- 0.85
+p_condoms_circ$circ_cov <- 0.90
+
+# Intensified PrEP and circumcision, retaining baseline condoms
+p_prep_circ <- base_p
+p_prep_circ$PrEP_covF <- 0.90
+p_prep_circ$PrEP_covM <- 0.90
+p_prep_circ$circ_cov <- 0.90
+
+# All interventions intensified
+p_all <- base_p
+p_all$condom_covF <- 0.85
+p_all$condom_covM <- 0.85
+p_all$PrEP_covF <- 0.90
+p_all$PrEP_covM <- 0.90
+p_all$circ_cov <- 0.90
+
+# Define intervention scenarios
 scenarios <- list(
-
-  # BASELINE
-  Baseline = params_calibrated,
-
-  # NO INTERVENTION
-  No_Intervention = within(params_calibrated, {
-
-    condom_covF <- 0
-    condom_covM <- 0
-    PrEP_covF <- 0
-    PrEP_covM <- 0
-    circ_cov <- 0
-  }),
-
-  # SINGLE INTERVENTIONS
-  Condoms_Only = within(params_calibrated, {
-
-    condom_covF <- 0.85
-    condom_covM <- 0.85
-  }),
-
-  PrEP_Only = within(params_calibrated, {
-
-    PrEP_covF <- 0.90
-    PrEP_covM <- 0.90
-  }),
-
-  Circumcision_Only = within(params_calibrated, {
-
-    circ_cov <- 0.90
-  }),
-
-  # TWO-COMBINATION PACKAGES
-  Condoms_PrEP = within(params_calibrated, {
-
-    condom_covF <- 0.85
-    condom_covM <- 0.85
-
-    PrEP_covF <- 0.90
-    PrEP_covM <- 0.90
-  }),
-
-  Condoms_Circ = within(params_calibrated, {
-
-    condom_covF <- 0.85
-    condom_covM <- 0.85
-
-    circ_cov <- 0.90
-  }),
-
-  PrEP_Circ = within(params_calibrated, {
-
-    PrEP_covF <- 0.90
-    PrEP_covM <- 0.90
-
-    circ_cov <- 0.90
-  }),
-
-  # FULL COMBINATION
-  All_Interventions = within(params_calibrated, {
-
-    condom_covF <- 0.85
-    condom_covM <- 0.85
-
-    PrEP_covF <- 0.90
-    PrEP_covM <- 0.90
-
-    circ_cov <- 0.90
-  })
+  Baseline = base_p,
+  No_Intervention = p_none,
+  Condoms_Added = p_condoms,
+  PrEP_Added = p_prep,
+  Circumcision_Added = p_circ,
+  Condoms_PrEP = p_condoms_prep,
+  Condoms_Circumcision = p_condoms_circ,
+  PrEP_Circumcision = p_prep_circ,
+  All_Interventions = p_all
 )
-# Scenario outputs
+
+# Run each scenario
 outputs <- lapply(scenarios, run_model)
+
+# Calculate terminal prevalence, R0, Re and integrated incidence
+summary_table <- do.call(rbind, lapply(names(outputs), function(n) {
+
+  out <- outputs[[n]]
+  p <- scenarios[[n]]
+
+  FSW_prev <- tail(
+    (out$IF + out$TF) /
+      (out$SF + out$IF + out$TF),
+    1
+  )
+
+  MC_prev <- tail(
+    (out$IM + out$TM) /
+      (out$SM + out$IM + out$TM),
+    1
+  )
+
+  state_end <- c(
+    SF = tail(out$SF, 1),
+    IF = tail(out$IF, 1),
+    TF = tail(out$TF, 1),
+    SM = tail(out$SM, 1),
+    IM = tail(out$IM, 1),
+    TM = tail(out$TM, 1)
+  )
+
+  data.frame(
+    Scenario = n,
+    FSW_prev = as.numeric(FSW_prev),
+    MC_prev = as.numeric(MC_prev),
+    R0 = calc_R0_untreated(p),
+    Re_terminal = calc_Re_NGM(p, state_end),
+    FSW_integrated_incidence = pracma::trapz(
+      out$time, out$incF
+    ),
+    MC_integrated_incidence = pracma::trapz(
+      out$time, out$incM
+    )
+  )
+}))
+
+# Reductions relative to the no-intervention scenario
+no_int <- summary_table[
+  summary_table$Scenario == "No_Intervention", ]
+
+summary_table$FSW_reduction_vs_none <- 100 * (
+  1 - summary_table$FSW_prev / no_int$FSW_prev
+)
+
+summary_table$MC_reduction_vs_none <- 100 * (
+  1 - summary_table$MC_prev / no_int$MC_prev
+)
+
+# Incremental reductions relative to baseline
+baseline <- summary_table[
+  summary_table$Scenario == "Baseline", ]
+
+summary_table$FSW_reduction_vs_baseline <- 100 * (
+  1 - summary_table$FSW_prev / baseline$FSW_prev
+)
+
+summary_table$MC_reduction_vs_baseline <- 100 * (
+  1 - summary_table$MC_prev / baseline$MC_prev
+)
+
+# Display results
+summary_table_print <- summary_table
+numeric_cols <- vapply(summary_table_print, is.numeric, logical(1))
+summary_table_print[numeric_cols] <- lapply(
+  summary_table_print[numeric_cols],
+  round,
+  digits = 3
+)
+
+print(summary_table_print, row.names = FALSE)
 ```
 
 ```{r}
+# Run all intervention scenarios
+outputs <- lapply(scenarios, run_model)
+
+# Create intervention summary
 summary_table <- do.call(
   rbind,
-
-  lapply(names(outputs), function(n){
+  lapply(names(scenarios), function(n) {
 
     out <- outputs[[n]]
-    p   <- scenarios[[n]]
+    p <- scenarios[[n]]
 
+    # Terminal prevalence
     FSW_prev <- tail(
       (out$IF + out$TF) /
-
-      (out$SF  + out$IF  + out$TF),
-      1
+        (out$SF + out$IF + out$TF), 1
     )
 
     MC_prev <- tail(
       (out$IM + out$TM) /
-      (out$SM + out$IM + out$TM),
-      1
+        (out$SM + out$IM + out$TM), 1
+    )
+
+    # Terminal state for effective reproduction number
+    state_end <- c(
+      SF = tail(out$SF, 1),
+      IF = tail(out$IF, 1),
+      TF = tail(out$TF, 1),
+      SM = tail(out$SM, 1),
+      IM = tail(out$IM, 1),
+      TM = tail(out$TM, 1)
     )
 
     data.frame(
       Scenario = n,
-      FSW_prev = round(FSW_prev, 3),
-      MC_prev  = round(MC_prev, 3),
-      R0 = round(calc_R0(p), 2),
-      Re = round(calc_Re(p), 2),
-      FSW_cum_inc = round(sum(out$incF), 2),
-      MC_cum_inc  = round(sum(out$incM), 2)
+      FSW_prev = FSW_prev,
+      MC_prev = MC_prev,
+      R0 = calc_R0(p),
+      Re_terminal = calc_Re(p, state_now = state_end),
+
+      # Integrated incidence over the simulation period
+      FSW_cum_inc = pracma::trapz(
+        out$time, out$incF
+      ),
+      MC_cum_inc = pracma::trapz(
+        out$time, out$incM
+      )
     )
   })
 )
-summary_table
 
 # INTERVENTION EFFECTIVENESS
-
-summary_table$FSW_reduction <- 
-  1 - (
-    summary_table$FSW_prev /
-    summary_table$FSW_prev[
-      summary_table$Scenario == "Baseline"
-    ]
-  )
-
-summary_table$MC_reduction <- 
-  1 - (
-    summary_table$MC_prev /
-    summary_table$MC_prev[
-      summary_table$Scenario == "Baseline"
-    ]
-  )
-
-# Rank interventions
-summary_table <- summary_table[
-  order(summary_table$FSW_reduction,
-        decreasing = TRUE),
+# Reference: No-intervention scenario
+reference_FSW <- summary_table$FSW_prev[
+  summary_table$Scenario == "No_Intervention"
 ]
 
-summary_table
+reference_MC <- summary_table$MC_prev[
+  summary_table$Scenario == "No_Intervention"
+]
 
+if (length(reference_FSW) != 1 ||
+    length(reference_MC) != 1 ||
+    !is.finite(reference_FSW) ||
+    !is.finite(reference_MC) ||
+    reference_FSW <= 0 ||
+    reference_MC <= 0) {
+  stop("Invalid no-intervention reference prevalence.")
+}
+
+# Percentage reduction compared with no intervention
+summary_table$FSW_reduction_pct <-
+  100 * (1 - summary_table$FSW_prev / reference_FSW)
+
+summary_table$MC_reduction_pct <-
+  100 * (1 - summary_table$MC_prev / reference_MC)
+
+# Rank by FSW prevalence reduction
+summary_table <- summary_table[
+  order(
+    summary_table$FSW_reduction_pct,
+    decreasing = TRUE
+  ),
+]
+
+# Print a rounded results table
+summary_table_print <- summary_table
+
+numeric_cols <- vapply(
+  summary_table_print,
+  is.numeric,
+  logical(1)
+)
+
+summary_table_print[numeric_cols] <- lapply(
+  summary_table_print[numeric_cols],
+  round,
+  digits = 3
+)
+
+print(summary_table_print)
 # RANKED INTERVENTION EFFECTIVENESS
 
 rank_df <- subset(
   summary_table,
-  !(Scenario %in%
-      c(
-        "Baseline",
-        "No_Intervention"
-      ))
+  !(Scenario %in% c("Baseline", "No_Intervention"))
+)
+
+# Order interventions by FSW reduction
+rank_df$Scenario <- factor(
+  rank_df$Scenario,
+  levels = rank_df$Scenario[
+    order(rank_df$FSW_reduction_pct)
+  ]
 )
 
 rank_long <- data.frame(
-
   Scenario = rep(rank_df$Scenario, 2),
 
-  Population = c(
-    rep("FSW", nrow(rank_df)),
-    rep("Male Clients", nrow(rank_df))
+  Population = factor(
+    c(
+      rep("FSW", nrow(rank_df)),
+      rep("Male Clients", nrow(rank_df))
+    ),
+    levels = c("FSW", "Male Clients")
   ),
 
-  Reduction = c(
-    rank_df$FSW_reduction,
-    rank_df$MC_reduction
+  Reduction_pct = c(
+    rank_df$FSW_reduction_pct,
+    rank_df$MC_reduction_pct
   )
 )
 
@@ -628,277 +1115,397 @@ ggplot(
   rank_long,
   aes(
     x = Scenario,
-    y = Reduction * 100,
+    y = Reduction_pct,
     fill = Population
   )
 ) +
-
   geom_col(position = "dodge") +
-
   coord_flip() +
-
   theme_bw() +
-
   labs(
     title = "Reduction in HIV Prevalence by Intervention",
-    x = "",
-    y = "% Reduction"
+    subtitle = "Relative to the no-intervention scenario at year 10",
+    x = NULL,
+    y = "Reduction in prevalence (%)",
+    fill = "Population"
   )
 ```
 ```{r}
 # Scenario prevalence plots
 plot_df <- do.call(
   rbind,
-
-  lapply(names(outputs), function(n){
+  lapply(names(outputs), function(n) {
 
     out <- outputs[[n]]
 
     data.frame(
-
       Time = out$time,
-
-      FSW =
-        (out$IF + out$TF) /
-
+      Scenario = n,
+      FSW = (out$IF + out$TF) /
         (out$SF + out$IF + out$TF),
-
-      MC =
-        (out$IM + out$TM) /
-        (out$SM + out$IM + out$TM),
-
-      Scenario = n
+      MC = (out$IM + out$TM) /
+        (out$SM + out$IM + out$TM)
     )
   })
 )
 
-plot_df2 <- subset(
+# FSW prevalence
+p_fsw <- ggplot(
   plot_df,
-  Scenario %in% c(
-    "Baseline",
-    "No_Intervention",
-    "All_Interventions"
+  aes(x = Time, y = FSW, colour = Scenario)
+) +
+  geom_line(linewidth = 0.9) +
+  theme_bw() +
+  labs(
+    title = "FSW HIV Prevalence Under Intervention Scenarios",
+    subtitle = "Modelled prevalence over time",
+    x = "Time (years)",
+    y = "HIV prevalence",
+    colour = "Scenario"
   )
-)
 
-ggplot(
-  plot_df2,
-  aes(Time, FSW, color = Scenario)
+print(p_fsw)
+
+# Male-client prevalence
+p_mc <- ggplot(
+  plot_df,
+  aes(x = Time, y = MC, colour = Scenario)
 ) +
-  geom_line(linewidth=1.3) +
+  geom_line(linewidth = 0.9) +
   theme_bw() +
   labs(
-    title="FSW HIV Prevalence",
-    y="Prevalence"
+    title = "Male-Client HIV Prevalence Under Intervention Scenarios",
+    subtitle = "Modelled prevalence over time",
+    x = "Time (years)",
+    y = "HIV prevalence",
+    colour = "Scenario"
   )
-ggplot(
-  plot_df2,
-  aes(Time, MC, color = Scenario)
-) +
-  geom_line(linewidth = 1.3) +
-  theme_bw() +
-  labs(
-    title = "Male Client HIV Prevalence",
-    y = "Prevalence"
-  )
+
+print(p_mc)
 ```
 
 ```{r}
-# Sensitivity analysis
+# 1. Define sensitivity ranges
+# These are illustrative levels; justify final ranges using
+# literature, programme data, or documented parameter bounds.
+
 sens_grid <- expand.grid(
 
-  beta_scale = c(0.5, 0.75, 1, 1.25, 1.5),
+  betaMF_scale = c(0.75, 1.00, 1.25),
+  betaFM_scale = c(0.75, 1.00, 1.25),
 
-  condom_covF = c(0.2, 0.4, 0.6, 0.8),
+  condom_covF = c(0.20, 0.50, 0.80),
+  condom_covM = c(0.20, 0.50, 0.80),
 
-  PrEP_covF = c(0.0, 0.2, 0.4)
+  PrEP_covF = c(0.00, 0.30, 0.60),
+  PrEP_covM = c(0.00, 0.30, 0.60),
 
+  circ_cov = c(0.20, 0.50, 0.80)
 )
 
-sens_results <- data.frame()
+# 3^7 = 2,187 parameter combinations
+nrow(sens_grid)
 
-for(i in 1:nrow(sens_grid)){
+# 2. Run the model for each parameter combination
+sens_list <- vector("list", nrow(sens_grid))
 
-  # copy baseline parameters
-  p <- params_calibrated
+for (i in seq_len(nrow(sens_grid))) {
 
-  # vary transmission probabilities
-  p$betaMF <- p$betaMF * sens_grid$beta_scale[i]
-  p$betaFM <- p$betaFM * sens_grid$beta_scale[i]
+# Start with the same calibrated parameter set each time
+  p <- p_all
 
-  # vary interventions
+  # Vary transmission probabilities independently
+  p$betaMF <- p_all$betaMF *
+    sens_grid$betaMF_scale[i]
+
+  p$betaFM <- p_all$betaFM *
+    sens_grid$betaFM_scale[i]
+
+  # Vary condom coverage in both populations
   p$condom_covF <- sens_grid$condom_covF[i]
-  p$PrEP_covF   <- sens_grid$PrEP_covF[i]
+  p$condom_covM <- sens_grid$condom_covM[i]
 
-  # run model
-  out <- run_model(p)
+  # Vary PrEP coverage in both populations
+  p$PrEP_covF <- sens_grid$PrEP_covF[i]
+  p$PrEP_covM <- sens_grid$PrEP_covM[i]
 
-  # final prevalence
+  # Vary male circumcision coverage
+  p$circ_cov <- sens_grid$circ_cov[i]
+
+  # Run model safely
+  out <- tryCatch(
+    run_model(p),
+    error = function(e) NULL
+  )
+
+  # Record failed simulations rather than stopping the loop
+  if (is.null(out)) {
+
+    sens_list[[i]] <- data.frame(
+      sens_grid[i, ],
+      FSW_prev = NA_real_,
+      MC_prev = NA_real_,
+      FSW_integrated_incidence = NA_real_,
+      MC_integrated_incidence = NA_real_
+    )
+
+    next
+  }
+
+  # Confirm required outputs are available
+  required_cols <- c(
+    "time", "SF", "IF", "TF",
+    "SM", "IM", "TM", "incF", "incM"
+  )
+
+  if (!all(required_cols %in% names(out))) {
+    stop(
+      "The model output is missing required columns. ",
+      "Check run_model() and its output names."
+    )
+  }
+
+  # Year-10 prevalence
   FSW_prev <- tail(
     (out$IF + out$TF) /
-
-    (out$SF + out$IF + out$TF),
+      (out$SF + out$IF + out$TF),
     1
   )
 
   MC_prev <- tail(
     (out$IM + out$TM) /
-    (out$SM + out$IM + out$TM),
+      (out$SM + out$IM + out$TM),
     1
   )
 
-  # cumulative incidence
-  FSW_cum <- sum(out$incF)
-  MC_cum  <- sum(out$incM)
+  # Integrated incidence over the simulation period
+  # individual-level infection probabilities.
+  FSW_int_inc <- pracma::trapz(
+    out$time, out$incF
+  )
 
-  sens_results <- rbind(
-    sens_results,
+  MC_int_inc <- pracma::trapz(
+    out$time, out$incM
+  )
 
-    data.frame(
-      beta_scale  = sens_grid$beta_scale[i],
-      condom_covF = sens_grid$condom_covF[i],
-      PrEP_covF   = sens_grid$PrEP_covF[i],
+  # Save results
+  sens_list[[i]] <- data.frame(
+    sens_grid[i, ],
 
-      FSW_prev = FSW_prev,
-      MC_prev  = MC_prev,
+    FSW_prev = FSW_prev,
+    MC_prev = MC_prev,
 
-      FSW_cum = FSW_cum,
-      MC_cum  = MC_cum
-    )
+    FSW_integrated_incidence = FSW_int_inc,
+    MC_integrated_incidence = MC_int_inc
   )
 }
-# SENSITIVITY PLOTS
-# FSW Prevalence
-ggplot(
-  sens_results,
-  aes(beta_scale,
-      FSW_prev,
-      color = factor(condom_covF))
-) +
 
-  geom_point(size = 3) +
+# 3. Combine results
+sens_results <- do.call(rbind, sens_list)
 
-  geom_line() +
-
-  facet_wrap(~PrEP_covF) +
-
-  labs(
-    title = "Sensitivity Analysis: FSW Prevalence",
-    x = "Transmission Scaling",
-    y = "FSW HIV Prevalence",
-    color = "Condom Coverage"
-  )
-  ggplot(
-  sens_results,
-  aes(beta_scale,
-      FSW_prev,
-      color = factor(condom_covF))
-) +
-
-  geom_point(size = 3) +
-
-  geom_line() +
-
-  facet_wrap(~PrEP_covF) +
-
-  labs(
-    title = "Sensitivity Analysis: FSW Prevalence",
-    x = "Transmission Scaling",
-    y = "FSW HIV Prevalence",
-    color = "Condom Coverage"
-  )
-# Male client prevalence
-  ggplot(
-  sens_results,
-  aes(beta_scale,
-      MC_prev,
-      color = factor(condom_covF))
-) +
-
-  geom_point(size = 3) +
-
-  geom_line() +
-
-  facet_wrap(~PrEP_covF) +
-
-  labs(
-    title = "Sensitivity Analysis: Male Client Prevalence",
-    x = "Transmission Scaling",
-    y = "Male Client HIV Prevalence",
-    color = "Condom Coverage"
-  )
-```
-```{r}
-# Heat maps
-coverage_grid <- expand.grid(
-
-  condom_covF = seq(0, 0.9, by = 0.1),
-
-  PrEP_covF = seq(0, 0.8, by = 0.1)
-
+# Check successful and failed simulations
+cat(
+  "Total combinations:", nrow(sens_results), "\n",
+  "Successful runs:",
+  sum(complete.cases(sens_results$FSW_prev)), "\n",
+  "Failed runs:",
+  sum(is.na(sens_results$FSW_prev)), "\n"
 )
 
-heatmap_results <- data.frame()
+# Remove failed simulations for summaries and plots
+sens_results_ok <- sens_results[
+  complete.cases(
+    sens_results[, c(
+      "FSW_prev", "MC_prev",
+      "FSW_integrated_incidence",
+      "MC_integrated_incidence"
+    )]
+  ),
+]
 
-# Heat map analysis
-for(i in 1:nrow(coverage_grid)){
+# Inspect the results
+head(sens_results_ok)
+summary(sens_results_ok$FSW_prev)
+summary(sens_results_ok$MC_prev)
 
-  p <- params_calibrated
+# SENSITIVITY PLOTS
 
-  p$condom_covF <- coverage_grid$condom_covF[i]
-  p$PrEP_covF   <- coverage_grid$PrEP_covF[i]
-
-  out <- run_model(p)
-
-  # cumulative incidence
-  FSW_cum <- sum(out$incF)
-  MC_cum  <- sum(out$incM)
-
-  # prevalence
-  FSW_prev <- tail(
-    (out$IF + out$TF) /
-
-    (out$SF + out$IF + out$TF),
-    1
-  )
-
-  MC_prev <- tail(
-    (out$IM + out$TM) /
-    (out$SM + out$IM + out$TM),
-    1
-  )
-
-  heatmap_results <- rbind(
-    heatmap_results,
-
-    data.frame(
-      condom_covF = p$condom_covF,
-      PrEP_covF   = p$PrEP_covF,
-
-      FSW_cum = FSW_cum,
-      MC_cum  = MC_cum,
-
-      FSW_prev = FSW_prev,
-      MC_prev  = MC_prev
+# A. FSW prevalence by transmission probability and
+# FSW condom coverage, faceted by FSW PrEP coverage
+ggplot(
+  sens_results_ok,
+  aes(
+    x = betaMF_scale,
+    y = FSW_prev,
+    colour = factor(condom_covF),
+    group = interaction(
+      condom_covF, betaFM_scale
     )
   )
-}
-# Heat map FSW prevalence
+) +
+  geom_point(alpha = 0.65) +
+  geom_line(alpha = 0.65) +
+  facet_grid(
+    PrEP_covF ~ betaFM_scale,
+    labeller = label_both
+  ) +
+  labs(
+    title = "Sensitivity of FSW HIV Prevalence",
+    x = "Male-to-FSW transmission probability scale",
+    y = "Year-10 FSW HIV prevalence",
+    colour = "FSW condom coverage"
+  ) +
+  theme_minimal()
+
+# B. Male client prevalence
 ggplot(
-  heatmap_results,
+  sens_results_ok,
   aes(
-    x = condom_covF,
-    y = PrEP_covF,
-    fill = FSW_prev
+    x = betaFM_scale,
+    y = MC_prev,
+    colour = factor(condom_covM)
   )
 ) +
-
-  geom_tile() +
-
+  geom_point(alpha = 0.65) +
+  geom_line(
+    aes(group = interaction(
+      condom_covM, betaMF_scale
+    )),
+    alpha = 0.65
+  ) +
+  facet_grid(
+    PrEP_covM ~ betaMF_scale,
+    labeller = label_both
+  ) +
   labs(
-    title = "Heatmap: FSW HIV Prevalence",
-    x = "FSW Condom Coverage",
-    y = "FSW PrEP Coverage",
-    fill = "Prevalence"
-  )
+    title = "Sensitivity of Male Client HIV Prevalence",
+    x = "FSW-to-male transmission probability scale",
+    y = "Year-10 male client HIV prevalence",
+    colour = "Male condom coverage"
+  ) +
+  theme_minimal()
+
+# C. Compare the distribution of prevalence outcomes
+ggplot(
+  sens_results_ok,
+  aes(x = FSW_prev)
+) +
+  geom_histogram(bins = 30) +
+  labs(
+    title = "Distribution of FSW Prevalence Across Scenarios",
+    x = "Year-10 FSW HIV prevalence",
+    y = "Number of parameter combinations"
+  ) +
+  theme_minimal()
+
+ggplot(
+  sens_results_ok,
+  aes(x = MC_prev)
+) +
+  geom_histogram(bins = 30) +
+  labs(
+    title = "Distribution of Male Client Prevalence Across Scenarios",
+    x = "Year-10 male client HIV prevalence",
+    y = "Number of parameter combinations"
+  ) +
+  theme_minimal()
+
+# RANK-CORRELATION SENSITIVITY SUMMARY
+
+parameter_names <- c(
+  "betaMF_scale",
+  "betaFM_scale",
+  "condom_covF",
+  "condom_covM",
+  "PrEP_covF",
+  "PrEP_covM",
+  "circ_cov"
+)
+
+outcome_names <- c(
+  "FSW_prev",
+  "MC_prev",
+  "FSW_integrated_incidence",
+  "MC_integrated_incidence"
+)
+
+sensitivity_correlations <- do.call(
+  rbind,
+  lapply(outcome_names, function(outcome) {
+
+    do.call(
+      rbind,
+      lapply(parameter_names, function(parameter) {
+
+        test <- cor.test(
+          sens_results_ok[[parameter]],
+          sens_results_ok[[outcome]],
+          method = "spearman",
+          exact = FALSE
+        )
+
+        data.frame(
+          Parameter = parameter,
+          Outcome = outcome,
+          Spearman_rho = unname(test$estimate),
+          p_value = test$p.value
+        )
+      })
+    )
+  })
+)
+
+# Rank strongest absolute associations within each outcome
+sensitivity_correlations <- sensitivity_correlations[
+  order(
+    sensitivity_correlations$Outcome,
+    -abs(sensitivity_correlations$Spearman_rho)
+  ),
+]
+
+print(sensitivity_correlations)
+
+# save results for the manuscript 
+write.csv(
+  sens_results_ok,
+  "expanded_sensitivity_results.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  sensitivity_correlations,
+  "sensitivity_rank_correlations.csv",
+  row.names = FALSE
+)
+
+```
+
+``` {r}
+#QUALITY CHECKS
+stopifnot(
+  is.data.frame(comparison),
+  nrow(comparison) == 2,
+  isTRUE(all.equal(
+    comparison$R0[1],
+    comparison$R0[2],
+    tolerance = 1e-6
+  )),
+  is.data.frame(summary_table),
+  nrow(summary_table) == length(scenarios),
+  all(is.finite(as.matrix(
+    summary_table[, vapply(summary_table, is.numeric, logical(1))]
+  ))),
+  all(is.finite(plot_df$FSW)),
+  all(is.finite(plot_df$MC))
+)
+
+cat("All final quality checks passed.\n")
+cat("Number of intervention scenarios:", nrow(summary_table), "\n")
+cat("Baseline FSW prevalence:",
+    round(baseline$FSW_prev, 3), "\n")
+cat("Baseline male-client prevalence:",
+    round(baseline$MC_prev, 3), "\n")
+cat("Baseline R0:", round(baseline$R0, 3), "\n")
+cat("Baseline terminal Re:",
+    round(baseline$Re_terminal, 3), "\n")
 ```
