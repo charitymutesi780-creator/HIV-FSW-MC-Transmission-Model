@@ -6,8 +6,8 @@ Model parameters, assumptions, and calibration targets are provided in the accom
 
 ## Files
 
-- HIV_Model.R : Main model code
-- Outputs.xlsx : Model outputs (Consider HTML file not pdf)
+- HIV_Model.R : Main model code (Fifth_With_CM Rmd file)
+- Outputs.xlsx : Model outputs (Fifth_With_CM HTML file)
 - Sensitivity_Analysis.xlsx : Sensitivity analysis results
 
 ## Requirements
