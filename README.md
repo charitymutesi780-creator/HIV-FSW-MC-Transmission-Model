@@ -7,9 +7,8 @@ Model parameters, assumptions, and calibration targets are provided in the accom
 ## Files
 
 - HIV_Model.R : Main model code
-- Outputs.xlsx : Model outputs
+- Outputs.xlsx : Model outputs (Consider HTML file not pdf)
 - Sensitivity_Analysis.xlsx : Sensitivity analysis results
-- Heatmap.png : Heat map showing HIV prevalence under varying intervention coverages
 
 ## Requirements
 
